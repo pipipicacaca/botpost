@@ -174,6 +174,48 @@ async def cmd_start(message: Message, state: FSMContext):
     await _show_main(message)
 
 
+@dp.message(Command("emojis"))
+async def cmd_emojis(message: Message):
+    """
+    Диагностика: какие unicode-эмодзи доступны в загруженных паках.
+    Внизу — те 6 кнопок, по которым были жалобы, помечены ✅/❌ в зависимости
+    от того, нашли мы для них custom_emoji_id или нет.
+    """
+    keys = emoji.all_keys()
+    if not keys:
+        await message.answer("❌ Паки не загружены. Проверь логи: `failed to load pack ...`")
+        return
+
+    # Цепочки кандидатов из keyboards.py — должны совпадать.
+    diag = {
+        "Нумер.":      ["🔢", "1️⃣", "📑", "📋", "🗒"],
+        "Чеклист":     ["☑️", "✅", "✔️", "📋", "📝"],
+        "Спойлер":     ["🙈", "👁‍🗨", "🔽", "▶️", "📂", "📁"],
+        "Разделитель": ["➖", "—", "━", "─", "〰️", "▬"],
+        "Фото-поиск":  ["🔍", "🔎", "🔭", "🖼", "📸"],
+        "Видео":       ["🎬", "🎥", "📹", "📽", "▶️"],
+    }
+    lines = [f"📦 <b>Загружено эмодзи:</b> {len(keys)}\n"]
+    lines.append("🔎 <b>Диагностика проблемных кнопок:</b>\n")
+    for label, candidates in diag.items():
+        hits = [c for c in candidates if emoji.icon_id(c)]
+        status = "✅" if hits else "❌"
+        chain = " → ".join(candidates)
+        lines.append(f"{status} <b>{label}</b>: {chain}")
+        if hits:
+            lines.append(f"    │ матч: {hits[0]}")
+        lines.append("")
+
+    lines.append("🎨 <b>Все доступные эмодзи в паках:</b>")
+    # Группами по 30 — иначе одно длинное сообщение нечитаемо.
+    chunk = " ".join(keys)
+    lines.append(chunk[:3500])
+    if len(chunk) > 3500:
+        lines.append(f"\n… +{len(chunk) - 3500} символов")
+
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
 @dp.callback_query(F.data == "back")
 async def cb_back(call: CallbackQuery, state: FSMContext):
     await state.clear()

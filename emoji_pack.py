@@ -110,3 +110,8 @@ def md(text: str) -> str:
 
 def loaded() -> bool:
     return bool(_map)
+
+
+def all_keys() -> list[str]:
+    """Все unicode-эмодзи, проиндексированные из паков (для диагностики)."""
+    return list(_map.keys())
