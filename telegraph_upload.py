@@ -1,21 +1,21 @@
 """
-Загрузка медиа на публичный хостинг для получения ПОСТОЯННОГО прямого URL.
+Загрузка медиа на публичный хостинг для получения ПРЯМОГО HTTPS-URL.
 
-Telegram Rich Message (Bot API 10.1, sendRichMessage) встраивает медиа по
-HTTPS-URL: `![](https://.../photo.jpg)`. Тип определяется по MIME/расширению,
-поэтому имя файла на хосте обязано иметь корректное расширение.
+Telegram при обработке sendRichMessage сам скачивает медиа по URL и кладёт
+на свой CDN — далее картинка живёт в Telegram, как обычное фото. Это значит,
+что временного URL на 10 минут достаточно: TG успевает забрать файл за секунды.
 
-Telegram при обработке sendRichMessage сам качает медиа по URL и кладёт на
-свой CDN, поэтому даже временный хост (1ч–3д) подходит — URL нужен только
-в момент отправки.
+Поэтому мы намеренно используем КОРОТКИЙ TTL на хостинге, чтобы публичный
+файл жил минимум времени и не был доступен по случайно утёкшему URL:
+  • imgbb     — expiration=600 (10 минут)
+  • Litterbox — time=1h        (минимально доступный тариф)
+  • uguu.se   — 3 дня (нерегулируемо)
 
-Цепочка хостеров (по приоритету):
-  1. imgbb       — фото; самый стабильный; нужен IMGBB_KEY.
-  2. Catbox.moe  — фото/видео/аудио; постоянное хранение.
-  3. Litterbox   — тот же движок, но временный (1ч–72ч), другой anti-abuse
-                   профиль; работает, когда основной Catbox отвечает
-                   «Invalid uploader» с cloud IP.
-  4. uguu.se     — 3-дневное хранение, прямой URL.
+Цепочка хостеров:
+  1. imgbb       — фото; самый стабильный; auto-delete 10 мин; нужен IMGBB_KEY.
+  2. Litterbox   — фото/видео/аудио; auto-delete 1 час.
+  3. uguu.se     — fallback; 3 дня.
+  4. Catbox.moe  — последняя надежда; постоянное хранение.
 
 Лимит Telegram getFile — 20 МБ.
 
@@ -37,6 +37,11 @@ IMGBB_API = "https://api.imgbb.com/1/upload"
 TIMEOUT = aiohttp.ClientTimeout(total=60)
 # Многие хостеры режут пустой/«пайтоновский» UA как ботов.
 UA = "Mozilla/5.0 (compatible; PostBuilder/1.0; +https://t.me/)"
+
+# TTL для файлов на хостингах. Telegram забирает медиа в момент sendRichMessage,
+# дальше URL не нужен. Минимизируем окно, в которое случайный URL остаётся живым.
+IMGBB_TTL_SEC = 600   # 10 минут
+LITTERBOX_TIME = "1h"  # минимально допустимое значение в API Litterbox
 
 
 async def _download(bot, file_id: str) -> bytes | None:
@@ -79,7 +84,7 @@ async def _to_litterbox(data: bytes, filename: str) -> str | None:
     try:
         form = aiohttp.FormData()
         form.add_field("reqtype", "fileupload")
-        form.add_field("time", "72h")
+        form.add_field("time", LITTERBOX_TIME)
         form.add_field("fileToUpload", data, filename=filename)
         async with aiohttp.ClientSession(
             timeout=TIMEOUT, headers={"User-Agent": UA}
@@ -119,13 +124,14 @@ async def _to_uguu(data: bytes, filename: str) -> str | None:
 
 
 async def _to_imgbb(data: bytes) -> str | None:
-    """imgbb — только изображения, нужен ключ."""
+    """imgbb — только изображения. expiration=TTL → авто-удаление файла."""
     try:
         b64 = base64.b64encode(data).decode()
         form = aiohttp.FormData()
         form.add_field("image", b64)
+        url = f"{IMGBB_API}?key={IMGBB_KEY}&expiration={IMGBB_TTL_SEC}"
         async with aiohttp.ClientSession(timeout=TIMEOUT) as s:
-            async with s.post(f"{IMGBB_API}?key={IMGBB_KEY}", data=form) as r:
+            async with s.post(url, data=form) as r:
                 j = await r.json(content_type=None)
                 if j.get("success"):
                     return j["data"]["url"]
@@ -143,8 +149,8 @@ async def _upload_with_fallback(data: bytes, filename: str,
         url = await _to_imgbb(data)
         if url:
             return url
-    # Порядок: сначала рабочие хосты (Litterbox/uguu), Catbox — последний
-    # на случай если когда-нибудь починят анти-абуз для cloud IP.
+    # Порядок: сначала самый короткоживущий и проверенный хост, затем fallback'и.
+    # Catbox — последний на случай, если когда-нибудь починят анти-абуз cloud IP.
     for fn in (_to_litterbox, _to_uguu, _to_catbox):
         url = await fn(data, filename)
         if url:

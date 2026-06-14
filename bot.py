@@ -1,14 +1,17 @@
 """
 🤖 PostBuilder Bot — конструктор постов в Telegram Rich Markdown (Bot API 10.1).
 
-Человек собирает пост из блоков по кнопкам, пишет текст руками — бот рендерит
-в Rich Markdown (заголовки, таблицы, LaTeX, чеклисты, code, цитаты, спойлеры)
-и отправляет как Rich Message, который Telegram рисует нативно. Фото/видео/
-аудио/коллаж/карта уходят отдельными сообщениями.
+Сборка постов происходит в «живой панели» — одно сообщение, которое
+редактируется по ходу работы. Чат остаётся чистым, всё видно сразу.
 
-Стек: aiogram 3 (async, FSM), SQLite (WAL), деплой на Railway.
+Текст панели (HTML) использует custom emoji из паков TgAndroidIcons и
+tgiosicons — у Premium-пользователей они рендерятся как красивые иконки,
+у остальных деградируют до обычного Unicode.
+
+Стек: aiogram 3 (async, FSM), SQLite (WAL).
 """
 import asyncio
+import html as _html
 import logging
 import os
 
@@ -17,14 +20,16 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 
 import database as db
+import emoji_pack as emoji
 import keyboards as kb
-from renderer import render_post, render_preview, BLOCK_NAMES
+import panel
 from photo_search import search_photos
+from renderer import BLOCK_NAMES, render_post, render_preview
 from sender import send_rich
-from telegraph_upload import upload_photo, upload_video, upload_audio
+from telegraph_upload import upload_audio, upload_photo, upload_video
 
 logging.basicConfig(level=logging.INFO)
 
@@ -32,9 +37,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 if not BOT_TOKEN:
     raise SystemExit("❌ BOT_TOKEN не задан. Экспортируй env-переменную BOT_TOKEN=...")
 
-# Служебные сообщения шлём БЕЗ parse_mode (plain) — иначе спецсимволы (_ * `)
-# в подсказках/превью/тексте пользователя ломают разбор разметки.
-# Готовый пост уходит отдельно через sender.send_rich (свой запрос).
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
@@ -53,53 +55,125 @@ class Flow(StatesGroup):
     waiting_edit = State()
 
 
-# Подсказки по вводу для текстовых типов.
 PROMPTS = {
-    "heading":     "Заголовок. Можно в начале указать уровень 1–6 и двоеточие, напр. «2: Новости». Без цифры — будет H2:",
-    "text":        "Текст абзаца:",
-    "list":        "Пункты списка — каждый с новой строки:",
-    "numbered":    "Пункты — каждый с новой строки (пронумерую сам):",
-    "checklist":   "Пункты чеклиста — каждый с новой строки. Поставь «+ » в начале строки для отмеченного пункта:",
-    "quote":       "Текст цитаты:",
-    "code":        "Код. Первая строка может быть языком в формате «lang: python», иначе без подсветки:",
-    "table":       "Таблица: ряды по строкам, ячейки через «;». Первый ряд — шапка.\nПример:\nДата;Матч;Счёт\n11.06;Мексика-ЮАР;2:0",
-    "math":        "Формула в LaTeX (без $). Пример: \\sum_{i=1}^n i = \\frac{n(n+1)}2",
-    "pullquote":   "Текст pull-quote (крупная выделенная цитата):",
-    "collapsible": "Сначала заголовок секции, затем с новой строки — содержимое:",
+    "heading":     "📝 <b>Заголовок</b>\n\nМожно в начале указать уровень 1–6 и двоеточие, напр. «2: Новости». Без цифры — будет H2.",
+    "text":        "📝 <b>Абзац</b>\n\nНапиши текст:",
+    "list":        "• <b>Маркированный список</b>\n\nПункты — каждый с новой строки:",
+    "numbered":    "🔢 <b>Нумерованный список</b>\n\nПункты — каждый с новой строки, я пронумерую сам:",
+    "checklist":   "☑️ <b>Чеклист</b>\n\nПункты — каждый с новой строки. Поставь «+ » в начале строки для отмеченного.",
+    "quote":       "❝ <b>Цитата</b>\n\nНапиши текст:",
+    "code":        "💻 <b>Код</b>\n\nПервая строка может быть языком в формате «lang: python»:",
+    "table":       "▦ <b>Таблица</b>\n\nРяды по строкам, ячейки через «;». Первый ряд — шапка.\nПример:\n<code>Дата;Матч;Счёт\n11.06;Мексика-ЮАР;2:0</code>",
+    "math":        "∑ <b>Формула</b>\n\nLaTeX без $. Пример:\n<code>\\sum_{i=1}^n i = \\frac{n(n+1)}2</code>",
+    "pullquote":   "❞ <b>Pull-quote</b>\n\nКрупная выделенная цитата:",
+    "collapsible": "▸ <b>Спойлер-секция</b>\n\nПервая строка — заголовок, затем с новой строки — содержимое.",
 }
 
 MEDIA_PROMPT_STATE = {
-    "photo": (Flow.waiting_photo, "📤 Пришли фото (можно с подписью):"),
-    "video": (Flow.waiting_video, "🎬 Пришли видео (можно с подписью):"),
-    "audio": (Flow.waiting_audio, "🎵 Пришли аудио/трек:"),
-    "collage": (Flow.waiting_collage, "🖼 Пришли несколько фото (по одному) — соберу в листаемый альбом со свайпом. Когда закончишь — нажми «Готово»."),
-    "map": (Flow.waiting_map, "📍 Пришли геолокацию (скрепка → Геопозиция) или координаты «55.75, 37.61»:"),
+    "photo": (Flow.waiting_photo, "🖼 <b>Фото</b>\n\nПришли фото (можно с подписью):"),
+    "video": (Flow.waiting_video, "🎬 <b>Видео</b>\n\nПришли видео (можно с подписью):"),
+    "audio": (Flow.waiting_audio, "🎵 <b>Аудио</b>\n\nПришли трек:"),
+    "collage": (Flow.waiting_collage,
+                "🖼 <b>Альбом со свайпом</b>\n\nПришли несколько фото по одному. "
+                "Когда закончишь — нажми «Готово»."),
+    "map": (Flow.waiting_map,
+            "📍 <b>Карта</b>\n\nПришли геопозицию (скрепка → Геопозиция) "
+            "или координаты «55.75, 37.61»."),
 }
 
+
+# ────────────────────── view-билдеры (текст панели) ──────────────────────
+
+def _h(text: str) -> str:
+    """HTML-escape + подстановка custom emoji."""
+    return emoji.html(_html.escape(text, quote=False))
+
+
+def _build_main_view(blocks: list[dict]) -> tuple[str, InlineKeyboardMarkup]:
+    """Главный экран панели: live-превью + основные действия."""
+    head = emoji.html("🛠 <b>Конструктор постов</b>\n\n")
+    if not blocks:
+        body = emoji.html("📭 Пост пуст. Жми <b>➕ Добавить блок</b>, чтобы начать.")
+    else:
+        body = emoji.html("📋 <b>Структура поста:</b>\n\n") + _h(render_preview(blocks))
+    return head + body, kb.main_menu()
+
+
+def _build_block_types_view() -> tuple[str, InlineKeyboardMarkup]:
+    text = emoji.html(
+        "🧱 <b>Какой блок добавить?</b>\n\n"
+        "📝 Текст и структура — заголовки, абзацы, списки.\n"
+        "🎯 Продвинутое — таблицы, формулы, код, спойлеры.\n"
+        "🖼 Медиа — фото, видео, аудио, альбом, карта."
+    )
+    return text, kb.block_types_menu()
+
+
+def _build_prompt_view(prompt_html: str) -> tuple[str, InlineKeyboardMarkup]:
+    """Экран ожидания ввода: текст-подсказка + кнопка отмены."""
+    return emoji.html(prompt_html), kb.back_menu()
+
+
+def _build_edit_list_view(blocks: list[dict]) -> tuple[str, InlineKeyboardMarkup]:
+    head = emoji.html("✏️ <b>Редактирование</b>\n\nВыбери блок:\n\n")
+    return head + _h(render_preview(blocks)), kb.edit_list_menu(blocks)
+
+
+def _build_block_actions_view(block: dict) -> tuple[str, InlineKeyboardMarkup]:
+    name = BLOCK_NAMES.get(block["type"], block["type"])
+    preview = (block.get("content") or "—")[:300]
+    text = (
+        emoji.html(f"<b>{_html.escape(name)}</b>\n\n")
+        + _h(preview)
+    )
+    return text, kb.block_actions_menu(block["id"])
+
+
+def _build_collage_view(count: int) -> tuple[str, InlineKeyboardMarkup]:
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    b = InlineKeyboardBuilder()
+    b.button(text=f"✅ Готово ({count} фото)", callback_data="collage_done")
+    b.button(text="⬅️ Отмена", callback_data="back")
+    b.adjust(1)
+    text = emoji.html(
+        "🖼 <b>Альбом со свайпом</b>\n\n"
+        f"Добавлено фото: <b>{count}</b>.\n"
+        "Шли ещё или жми «Готово»."
+    )
+    return text, b.as_markup()
+
+
+# ────────────────────── helpers ──────────────────────
+
+async def _show_main(target):
+    user_id = target.from_user.id
+    post_id = await db.get_or_create_active_post(user_id)
+    blocks = await db.get_blocks(post_id)
+    text, markup = _build_main_view(blocks)
+    await panel.show(bot, target, text, markup)
+
+
+# ────────────────────── handlers ──────────────────────
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
-    await db.get_or_create_active_post(message.from_user.id)
-    await message.answer(
-        "👋 Конструктор постов\n\n"
-        "Собираю посты в Rich Markdown — Telegram рисует заголовки, таблицы, "
-        "формулы и медиа нативно. Пиши текст, я оформлю.\n\n"
-        "Жми ➕ Добавить блок",
-        reply_markup=kb.main_menu(),
-    )
+    # /start всегда даёт свежую панель.
+    await panel.reset(bot, message.from_user.id)
+    await _show_main(message)
 
 
 @dp.callback_query(F.data == "back")
 async def cb_back(call: CallbackQuery, state: FSMContext):
     await state.clear()
-    await call.message.answer("🛠 Конструктор постов — выбери действие:", reply_markup=kb.main_menu())
+    await _show_main(call)
     await call.answer()
 
 
 @dp.callback_query(F.data == "add")
 async def cb_add(call: CallbackQuery):
-    await call.message.answer("Какой блок добавить?", reply_markup=kb.block_types_menu())
+    text, markup = _build_block_types_view()
+    await panel.show(bot, call, text, markup)
     await call.answer()
 
 
@@ -110,28 +184,31 @@ async def cb_new_block(call: CallbackQuery, state: FSMContext):
 
     if btype == "divider":
         await db.add_block(post_id, "divider")
-        await call.message.answer("✅ Разделитель добавлен.", reply_markup=kb.main_menu())
-        await call.answer()
+        await _show_main(call)
+        await call.answer("Разделитель добавлен")
         return
 
     if btype == "photosearch":
         await state.set_state(Flow.waiting_photo_query)
-        await call.message.answer("🔍 Что искать? Напиши запрос:", reply_markup=kb.back_menu())
+        text, markup = _build_prompt_view("🔍 <b>Поиск фото</b>\n\nЧто искать? Напиши запрос:")
+        await panel.show(bot, call, text, markup)
         await call.answer()
         return
 
     if btype in MEDIA_PROMPT_STATE:
-        st, text = MEDIA_PROMPT_STATE[btype]
+        st, prompt_text = MEDIA_PROMPT_STATE[btype]
         await state.set_state(st)
         await state.update_data(collage=[])
-        await call.message.answer(text, reply_markup=kb.back_menu())
+        text, markup = _build_prompt_view(prompt_text)
+        await panel.show(bot, call, text, markup)
         await call.answer()
         return
 
     # Текстовые/структурные блоки.
     await state.update_data(btype=btype, post_id=post_id)
     await state.set_state(Flow.waiting_content)
-    await call.message.answer(PROMPTS.get(btype, "Текст:"), reply_markup=kb.back_menu())
+    text, markup = _build_prompt_view(PROMPTS.get(btype, "Текст:"))
+    await panel.show(bot, call, text, markup)
     await call.answer()
 
 
@@ -140,10 +217,9 @@ async def on_content(message: Message, state: FSMContext):
     data = await state.get_data()
     btype = data["btype"]
     text = message.text or ""
-    extra = {}
+    extra: dict = {}
 
     if btype == "heading":
-        # «2: текст» -> level=2; иначе H2.
         if ":" in text and text.split(":", 1)[0].strip().isdigit():
             lvl, rest = text.split(":", 1)
             extra["level"] = int(lvl.strip())
@@ -151,7 +227,6 @@ async def on_content(message: Message, state: FSMContext):
         else:
             extra["level"] = 2
     elif btype == "code":
-        # «lang: python» в первой строке -> язык.
         first, _, rest = text.partition("\n")
         if first.lower().startswith("lang:"):
             extra["lang"] = first.split(":", 1)[1].strip()
@@ -163,100 +238,93 @@ async def on_content(message: Message, state: FSMContext):
 
     await db.add_block(data["post_id"], btype, content=text, extra=extra or None)
     await state.clear()
-    await message.answer(f"✅ Блок «{BLOCK_NAMES.get(btype, btype)}» добавлен.", reply_markup=kb.main_menu())
+    await panel.delete_user_message(message)
+    await _show_main(message)
 
 
 @dp.message(Flow.waiting_photo, F.photo)
 async def on_photo(message: Message, state: FSMContext):
     post_id = await db.get_or_create_active_post(message.from_user.id)
     file_id = message.photo[-1].file_id
-    await message.answer("⏳ Загружаю фото...")
+    # Подсказываем «грузим» прямо в панели.
+    await panel.show(bot, message, emoji.html("⏳ <b>Загружаю фото…</b>"), kb.back_menu())
     url = await upload_photo(bot, BOT_TOKEN, file_id)
-    if not url:
-        await message.answer("⚠️ Не удалось загрузить фото. Проверь, что бот — админ канала-хранилища.",
-                             reply_markup=kb.main_menu())
-        await state.clear()
-        return
-    await db.add_block(post_id, "photo", content=message.caption or "",
-                       media_id=file_id, extra={"url": url})
+    if url:
+        await db.add_block(post_id, "photo", content=message.caption or "",
+                           media_id=file_id, extra={"url": url})
+    else:
+        await db.add_block(post_id, "photo", content=message.caption or "",
+                           media_id=file_id)
     await state.clear()
-    await message.answer("✅ Фото добавлено (встроится в пост).", reply_markup=kb.main_menu())
+    await panel.delete_user_message(message)
+    await _show_main(message)
 
 
 @dp.message(Flow.waiting_video, F.video)
 async def on_video(message: Message, state: FSMContext):
     post_id = await db.get_or_create_active_post(message.from_user.id)
     file_id = message.video.file_id
-    await message.answer("⏳ Загружаю видео...")
+    await panel.show(bot, message, emoji.html("⏳ <b>Загружаю видео…</b>"), kb.back_menu())
     url = await upload_video(bot, BOT_TOKEN, file_id)
-    if not url:
-        await message.answer("⚠️ Не удалось загрузить видео. Уйдёт отдельным сообщением.",
-                             reply_markup=kb.main_menu())
+    if url:
         await db.add_block(post_id, "video", content=message.caption or "",
-                           media_id=file_id)  # без url -> отдельно
-        await state.clear()
-        return
-    await db.add_block(post_id, "video", content=message.caption or "",
-                       media_id=file_id, extra={"url": url})
+                           media_id=file_id, extra={"url": url})
+    else:
+        await db.add_block(post_id, "video", content=message.caption or "",
+                           media_id=file_id)
     await state.clear()
-    await message.answer("✅ Видео добавлено (встроится в пост).", reply_markup=kb.main_menu())
+    await panel.delete_user_message(message)
+    await _show_main(message)
 
 
 @dp.message(Flow.waiting_audio, F.audio)
 async def on_audio(message: Message, state: FSMContext):
     post_id = await db.get_or_create_active_post(message.from_user.id)
     file_id = message.audio.file_id
-    await message.answer("⏳ Загружаю аудио...")
-    # MIME аудио из Telegram обычно audio/mpeg или audio/ogg.
-    # Catbox сохранит расширение из filename — важно для Telegram (определяет тип по URL).
+    await panel.show(bot, message, emoji.html("⏳ <b>Загружаю аудио…</b>"), kb.back_menu())
     mime = (message.audio.mime_type or "").lower()
     ext = "ogg" if "ogg" in mime else "mp3"
     url = await upload_audio(bot, file_id, ext)
     if url:
         await db.add_block(post_id, "audio", content=message.caption or "",
                            media_id=file_id, extra={"url": url})
-        await message.answer("✅ Аудио добавлено (встроится в пост).", reply_markup=kb.main_menu())
     else:
-        # Не залилось → отправим отдельным сообщением при экспорте.
         await db.add_block(post_id, "audio", content=message.caption or "",
                            media_id=file_id)
-        await message.answer("⚠️ Не удалось залить аудио на хостинг — уйдёт отдельным сообщением.",
-                             reply_markup=kb.main_menu())
     await state.clear()
+    await panel.delete_user_message(message)
+    await _show_main(message)
 
 
 @dp.message(Flow.waiting_collage, F.photo)
 async def on_collage_photo(message: Message, state: FSMContext):
     data = await state.get_data()
-    urls = data.get("collage", [])
+    urls = list(data.get("collage", []))
     url = await upload_photo(bot, BOT_TOKEN, message.photo[-1].file_id)
+    await panel.delete_user_message(message)
     if not url:
-        await message.answer("⚠️ Это фото не залилось, пропускаю. Шли следующее.")
+        # Просто игнорим конкретное фото, юзеру показываем счёт без апа.
+        text, markup = _build_collage_view(len(urls))
+        await panel.show(bot, message, text + emoji.html("\n\n⚠️ Последнее фото не залилось."), markup)
         return
     urls.append(url)
     await state.update_data(collage=urls)
-    from aiogram.utils.keyboard import InlineKeyboardBuilder
-    b = InlineKeyboardBuilder()
-    b.button(text=f"✅ Готово ({len(urls)} фото)", callback_data="collage_done")
-    b.button(text="⬅️ Отмена", callback_data="back")
-    b.adjust(1)
-    await message.answer(f"Добавлено фото: {len(urls)}. Шли ещё или жми «Готово».",
-                         reply_markup=b.as_markup())
+    text, markup = _build_collage_view(len(urls))
+    await panel.show(bot, message, text, markup)
 
 
 @dp.callback_query(F.data == "collage_done")
 async def cb_collage_done(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    photos = data.get("collage", [])  # это список URL (Telegraph)
+    photos = data.get("collage", [])
     if not photos:
         await call.answer("Нет фото", show_alert=True)
         return
     post_id = await db.get_or_create_active_post(call.from_user.id)
     await db.add_block(post_id, "collage", extra={"urls": photos})
     await state.clear()
-    await call.message.answer(f"✅ Коллаж из {len(photos)} фото добавлен (встроится в пост).",
-                              reply_markup=kb.main_menu())
-    await call.answer()
+    await _show_main(call)
+    await call.answer(f"Альбом из {len(photos)} фото добавлен")
 
 
 @dp.message(Flow.waiting_map)
@@ -271,34 +339,48 @@ async def on_map(message: Message, state: FSMContext):
         except ValueError:
             pass
     if lat is None or not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
-        await message.answer("Не понял координаты. Пришли геопозицию или «55.75, 37.61» "
-                             "(широта −90…90, долгота −180…180).")
+        await panel.delete_user_message(message)
+        text, markup = _build_prompt_view(
+            "📍 <b>Карта</b>\n\n"
+            "Не понял координаты. Пришли геопозицию (скрепка) "
+            "или координаты «55.75, 37.61» (широта −90…90, долгота −180…180)."
+        )
+        await panel.show(bot, message, text, markup)
         return
     post_id = await db.get_or_create_active_post(message.from_user.id)
     await db.add_block(post_id, "map", extra={"lat": lat, "lon": lon})
     await state.clear()
-    await message.answer("✅ Карта добавлена.", reply_markup=kb.main_menu())
+    await panel.delete_user_message(message)
+    await _show_main(message)
 
 
 @dp.message(Flow.waiting_photo_query)
 async def on_photo_query(message: Message, state: FSMContext):
-    results = await search_photos(message.text or "")
+    query = message.text or ""
+    await panel.delete_user_message(message)
+    await panel.show(bot, message, emoji.html("⏳ <b>Ищу фото…</b>"), kb.back_menu())
+    results = await search_photos(query)
     await state.clear()
     if not results:
-        await message.answer("😕 Ничего не нашёл. Загрузи фото вручную.", reply_markup=kb.main_menu())
+        text, markup = _build_prompt_view(
+            "🔍 <b>Поиск фото</b>\n\n😕 Ничего не нашёл. Попробуй другой запрос."
+        )
+        await panel.show(bot, message, text, markup)
         return
     post_id = await db.get_or_create_active_post(message.from_user.id)
-    # URL — это уже публичный https-линк (Unsplash). Кладём в extra.url,
-    # чтобы renderer встроил фото в rich-пост через ![](url).
     await db.add_block(post_id, "photo", extra={"url": results[0]})
-    await message.answer("✅ Нашёл фото и добавил (встроится в пост).", reply_markup=kb.main_menu())
+    await _show_main(message)
 
 
 @dp.callback_query(F.data == "preview")
 async def cb_preview(call: CallbackQuery):
     post_id = await db.get_or_create_active_post(call.from_user.id)
     blocks = await db.get_blocks(post_id)
-    await call.message.answer(f"👁 Структура поста:\n\n{render_preview(blocks)}", reply_markup=kb.main_menu())
+    if not blocks:
+        await call.answer("Пост пуст", show_alert=True)
+        return
+    text = emoji.html("👁 <b>Структура поста:</b>\n\n") + _h(render_preview(blocks))
+    await panel.show(bot, call, text, kb.main_menu())
     await call.answer()
 
 
@@ -308,11 +390,11 @@ async def cb_edit_list(call: CallbackQuery, state: FSMContext):
     post_id = await db.get_or_create_active_post(call.from_user.id)
     blocks = await db.get_blocks(post_id)
     if not blocks:
-        await call.message.answer("Пост пуст.", reply_markup=kb.main_menu())
-        await call.answer()
+        await call.answer("Пост пуст", show_alert=True)
+        await _show_main(call)
         return
-    await call.message.answer("✏️ Выбери блок:\n\n" + render_preview(blocks),
-                              reply_markup=kb.edit_list_menu(blocks))
+    text, markup = _build_edit_list_view(blocks)
+    await panel.show(bot, call, text, markup)
     await call.answer()
 
 
@@ -323,9 +405,8 @@ async def cb_select_block(call: CallbackQuery):
     if not block:
         await call.answer("Не найдено", show_alert=True)
         return
-    name = BLOCK_NAMES.get(block["type"], block["type"])
-    prev = (block.get("content") or "—")[:200]
-    await call.message.answer(f"Блок: {name}\n\n{prev}", reply_markup=kb.block_actions_menu(block_id))
+    text, markup = _build_block_actions_view(block)
+    await panel.show(bot, call, text, markup)
     await call.answer()
 
 
@@ -334,7 +415,8 @@ async def cb_edit_block(call: CallbackQuery, state: FSMContext):
     block_id = int(call.data.split(":")[1])
     await state.update_data(edit_block_id=block_id)
     await state.set_state(Flow.waiting_edit)
-    await call.message.answer("✏️ Новый текст блока:", reply_markup=kb.back_menu())
+    text, markup = _build_prompt_view("✏️ <b>Редактирование блока</b>\n\nНовый текст:")
+    await panel.show(bot, call, text, markup)
     await call.answer()
 
 
@@ -343,7 +425,8 @@ async def on_edit(message: Message, state: FSMContext):
     data = await state.get_data()
     await db.update_block(data["edit_block_id"], content=message.text or "")
     await state.clear()
-    await message.answer("✅ Блок обновлён.", reply_markup=kb.main_menu())
+    await panel.delete_user_message(message)
+    await _show_main(message)
 
 
 @dp.callback_query(F.data.startswith("up:"))
@@ -361,7 +444,7 @@ async def cb_down(call: CallbackQuery):
 @dp.callback_query(F.data.startswith("del:"))
 async def cb_del(call: CallbackQuery):
     await db.delete_block(int(call.data.split(":")[1]))
-    await call.answer("🗑 Удалено")
+    await call.answer("Удалено")
     await _refresh_edit_list(call)
 
 
@@ -369,10 +452,11 @@ async def _refresh_edit_list(call: CallbackQuery):
     post_id = await db.get_or_create_active_post(call.from_user.id)
     blocks = await db.get_blocks(post_id)
     if not blocks:
-        await call.message.answer("Пост пуст.", reply_markup=kb.main_menu())
+        await _show_main(call)
+        await call.answer()
         return
-    await call.message.answer("✏️ Выбери блок:\n\n" + render_preview(blocks),
-                              reply_markup=kb.edit_list_menu(blocks))
+    text, markup = _build_edit_list_view(blocks)
+    await panel.show(bot, call, text, markup)
     await call.answer()
 
 
@@ -382,9 +466,7 @@ async def cb_export(call: CallbackQuery):
     if uid in _exporting:
         await call.answer("Уже собираю, подожди…")
         return
-    # Подтверждаем callback СРАЗУ: у Telegram ~15с лимит на answerCallbackQuery,
-    # а реальный экспорт (рендер + sendRichMessage + отдельные аудио) занимает дольше.
-    # Если ответить в конце, прилетает «query is too old».
+    # Подтверждаем callback СРАЗУ: у Telegram ~15с лимит на answerCallbackQuery.
     await call.answer()
     _exporting.add(uid)
     try:
@@ -397,42 +479,43 @@ async def _do_export(call: CallbackQuery):
     post_id = await db.get_or_create_active_post(call.from_user.id)
     blocks = await db.get_blocks(post_id)
     if not blocks:
-        # Callback уже отвечен — alert не покажем, шлём сообщением.
         await call.message.answer("Пост пуст — нечего собирать.")
         return
 
-    await call.message.answer("📤 Готовый пост:")
+    # Панель → «собираю», конечный пост уйдёт отдельным сообщением.
+    await panel.show(bot, call, emoji.html("📤 <b>Собираю пост…</b>"), kb.back_menu())
 
-    # 1) Весь пост (текст + фото + видео + коллаж + карта) — ОДНИМ rich message.
-    text = render_post(blocks)
+    # Кастомные эмодзи в финальном посте — превращаем unicode → tg-emoji
+    # внутри markdown (![](tg://emoji?id=...)).
+    text = emoji.md(render_post(blocks))
     if text:
         ok, err = await send_rich(BOT_TOKEN, call.message.chat.id, text)
         if not ok:
             logging.warning("sendRichMessage failed: %s", err)
             await call.message.answer(
-                "⚠️ Rich-формат не отправился (" + err[:100] + "). Сырой текст ниже:",
+                "⚠️ Rich-формат не отправился (" + err[:120] + "). Сырой текст ниже:",
                 parse_mode=None)
             await call.message.answer(text, parse_mode=None)
 
-    # 2) Аудио без публичного URL — отдельным сообщением (если хост не принял файл).
+    # Аудио без публичного URL — отдельным сообщением.
     for b in blocks:
         if b["type"] == "audio" and not (b.get("extra") or {}).get("url") and b["media_id"]:
             await call.message.answer_audio(b["media_id"], caption=b.get("content") or None)
 
-    # call.answer() уже сделан в cb_export — финальный «✅» шлём сообщением.
-    await call.message.answer("✅ Готово!", reply_markup=kb.main_menu())
+    await _show_main(call)
 
 
 @dp.callback_query(F.data == "reset")
 async def cb_reset(call: CallbackQuery, state: FSMContext):
     await state.clear()
     await db.reset_post(call.from_user.id)
-    await call.message.answer("🗑 Пост очищен.", reply_markup=kb.main_menu())
-    await call.answer()
+    await _show_main(call)
+    await call.answer("Пост очищен")
 
 
 async def main():
     await db.init_db()
+    await emoji.load_packs(bot)
     logging.info("PostBuilder bot started")
     await dp.start_polling(bot)
 
