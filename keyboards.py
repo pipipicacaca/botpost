@@ -36,7 +36,7 @@ def block_types_menu() -> InlineKeyboardMarkup:
     kb.button(text="🔍 Фото-поиск", callback_data="new:photosearch")
     kb.button(text="🎬 Видео", callback_data="new:video")
     kb.button(text="🎵 Аудио", callback_data="new:audio")
-    kb.button(text="🖼🖼 Коллаж", callback_data="new:collage")
+    kb.button(text="🖼 Альбом (свайп)", callback_data="new:collage")
     kb.button(text="📍 Карта", callback_data="new:map")
     kb.button(text="⬅️ Назад", callback_data="back")
     kb.adjust(2, 2, 2, 2, 2, 2, 2, 2, 2, 1)

@@ -72,7 +72,7 @@ MEDIA_PROMPT_STATE = {
     "photo": (Flow.waiting_photo, "📤 Пришли фото (можно с подписью):"),
     "video": (Flow.waiting_video, "🎬 Пришли видео (можно с подписью):"),
     "audio": (Flow.waiting_audio, "🎵 Пришли аудио/трек:"),
-    "collage": (Flow.waiting_collage, "🖼🖼 Пришли несколько фото (по одному). Когда закончишь — нажми «Готово»."),
+    "collage": (Flow.waiting_collage, "🖼 Пришли несколько фото (по одному) — соберу в листаемый альбом со свайпом. Когда закончишь — нажми «Готово»."),
     "map": (Flow.waiting_map, "📍 Пришли геолокацию (скрепка → Геопозиция) или координаты «55.75, 37.61»:"),
 }
 
@@ -382,6 +382,10 @@ async def cb_export(call: CallbackQuery):
     if uid in _exporting:
         await call.answer("Уже собираю, подожди…")
         return
+    # Подтверждаем callback СРАЗУ: у Telegram ~15с лимит на answerCallbackQuery,
+    # а реальный экспорт (рендер + sendRichMessage + отдельные аудио) занимает дольше.
+    # Если ответить в конце, прилетает «query is too old».
+    await call.answer()
     _exporting.add(uid)
     try:
         await _do_export(call)
@@ -393,7 +397,8 @@ async def _do_export(call: CallbackQuery):
     post_id = await db.get_or_create_active_post(call.from_user.id)
     blocks = await db.get_blocks(post_id)
     if not blocks:
-        await call.answer("Пост пуст", show_alert=True)
+        # Callback уже отвечен — alert не покажем, шлём сообщением.
+        await call.message.answer("Пост пуст — нечего собирать.")
         return
 
     await call.message.answer("📤 Готовый пост:")
@@ -414,7 +419,8 @@ async def _do_export(call: CallbackQuery):
         if b["type"] == "audio" and not (b.get("extra") or {}).get("url") and b["media_id"]:
             await call.message.answer_audio(b["media_id"], caption=b.get("content") or None)
 
-    await call.answer("✅ Готово!")
+    # call.answer() уже сделан в cb_export — финальный «✅» шлём сообщением.
+    await call.message.answer("✅ Готово!", reply_markup=kb.main_menu())
 
 
 @dp.callback_query(F.data == "reset")

@@ -27,7 +27,7 @@ BLOCK_NAMES = {
     "photo":       "🖼 Фото",
     "video":       "🎬 Видео",
     "audio":       "🎵 Аудио",
-    "collage":     "🖼🖼 Коллаж",
+    "collage":     "🖼 Альбом (свайп)",
     "map":         "📍 Карта",
 }
 
@@ -130,11 +130,12 @@ def render_block(block: dict) -> str:
         urls = extra.get("urls", [])
         if not urls:
             return ""
-        # Внутри <tg-collage> элементы — каждый ![]() с новой строки.
-        # Окружающие пустые строки обязательны: иначе markdown слипнет
-        # с соседними блоками и tg-collage не распарсится.
+        # <tg-slideshow> — листаемый альбом со свайпом и точками-индикаторами
+        # (то, что в Telegram воспринимается как «альбом из фоток»).
+        # Альтернатива <tg-collage> рисует сетку-мозаику — не то, что обычно
+        # хочется от «нескольких фото».
         inner = "\n".join(f"![]({u})" for u in urls)
-        return f"<tg-collage>\n\n{inner}\n\n</tg-collage>"
+        return f"<tg-slideshow>\n\n{inner}\n\n</tg-slideshow>"
 
     if t == "map":
         if "lat" not in extra or "lon" not in extra:
