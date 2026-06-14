@@ -24,11 +24,13 @@ import keyboards as kb
 from renderer import render_post, render_preview, BLOCK_NAMES
 from photo_search import search_photos
 from sender import send_rich
-from telegraph_upload import upload_photo, upload_video
+from telegraph_upload import upload_photo, upload_video, upload_audio
 
 logging.basicConfig(level=logging.INFO)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+if not BOT_TOKEN:
+    raise SystemExit("❌ BOT_TOKEN не задан. Экспортируй env-переменную BOT_TOKEN=...")
 
 # Служебные сообщения шлём БЕЗ parse_mode (plain) — иначе спецсимволы (_ * `)
 # в подсказках/превью/тексте пользователя ломают разбор разметки.
@@ -203,10 +205,24 @@ async def on_video(message: Message, state: FSMContext):
 @dp.message(Flow.waiting_audio, F.audio)
 async def on_audio(message: Message, state: FSMContext):
     post_id = await db.get_or_create_active_post(message.from_user.id)
-    await db.add_block(post_id, "audio", content=message.caption or "",
-                       media_id=message.audio.file_id)
+    file_id = message.audio.file_id
+    await message.answer("⏳ Загружаю аудио...")
+    # MIME аудио из Telegram обычно audio/mpeg или audio/ogg.
+    # Catbox сохранит расширение из filename — важно для Telegram (определяет тип по URL).
+    mime = (message.audio.mime_type or "").lower()
+    ext = "ogg" if "ogg" in mime else "mp3"
+    url = await upload_audio(bot, file_id, ext)
+    if url:
+        await db.add_block(post_id, "audio", content=message.caption or "",
+                           media_id=file_id, extra={"url": url})
+        await message.answer("✅ Аудио добавлено (встроится в пост).", reply_markup=kb.main_menu())
+    else:
+        # Не залилось → отправим отдельным сообщением при экспорте.
+        await db.add_block(post_id, "audio", content=message.caption or "",
+                           media_id=file_id)
+        await message.answer("⚠️ Не удалось залить аудио на хостинг — уйдёт отдельным сообщением.",
+                             reply_markup=kb.main_menu())
     await state.clear()
-    await message.answer("✅ Аудио добавлено.", reply_markup=kb.main_menu())
 
 
 @dp.message(Flow.waiting_collage, F.photo)
@@ -254,8 +270,9 @@ async def on_map(message: Message, state: FSMContext):
             lat, lon = float(a.strip()), float(b.strip())
         except ValueError:
             pass
-    if lat is None:
-        await message.answer("Не понял координаты. Пришли геопозицию или «55.75, 37.61».")
+    if lat is None or not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
+        await message.answer("Не понял координаты. Пришли геопозицию или «55.75, 37.61» "
+                             "(широта −90…90, долгота −180…180).")
         return
     post_id = await db.get_or_create_active_post(message.from_user.id)
     await db.add_block(post_id, "map", extra={"lat": lat, "lon": lon})
@@ -271,8 +288,10 @@ async def on_photo_query(message: Message, state: FSMContext):
         await message.answer("😕 Ничего не нашёл. Загрузи фото вручную.", reply_markup=kb.main_menu())
         return
     post_id = await db.get_or_create_active_post(message.from_user.id)
-    await db.add_block(post_id, "photo", media_id=results[0])
-    await message.answer("✅ Нашёл фото и добавил.", reply_markup=kb.main_menu())
+    # URL — это уже публичный https-линк (Unsplash). Кладём в extra.url,
+    # чтобы renderer встроил фото в rich-пост через ![](url).
+    await db.add_block(post_id, "photo", extra={"url": results[0]})
+    await message.answer("✅ Нашёл фото и добавил (встроится в пост).", reply_markup=kb.main_menu())
 
 
 @dp.callback_query(F.data == "preview")
@@ -390,10 +409,9 @@ async def _do_export(call: CallbackQuery):
                 parse_mode=None)
             await call.message.answer(text, parse_mode=None)
 
-    # 2) Аудио — отдельными сообщениями (Telegraph не хостит аудио,
-    #    встроить в rich-пост нельзя).
+    # 2) Аудио без публичного URL — отдельным сообщением (если хост не принял файл).
     for b in blocks:
-        if b["type"] == "audio" and b["media_id"]:
+        if b["type"] == "audio" and not (b.get("extra") or {}).get("url") and b["media_id"]:
             await call.message.answer_audio(b["media_id"], caption=b.get("content") or None)
 
     await call.answer("✅ Готово!")

@@ -31,13 +31,24 @@ BLOCK_NAMES = {
     "map":         "📍 Карта",
 }
 
-# Аудио не встраивается в rich (Telegraph не хостит) → шлём отдельным сообщением.
-SEPARATE_TYPES = {"audio"}
+# Раньше аудио всегда уходило отдельным сообщением — теперь умеем встраивать,
+# если хост принял файл и есть public URL. Без URL рендер пропустит блок,
+# а bot._do_export отправит аудио отдельно.
+SEPARATE_TYPES: set[str] = set()
 
 
 def _url(block: dict) -> str:
     """URL медиа из extra['url'] (одиночное медиа)."""
     return (block.get("extra") or {}).get("url", "")
+
+
+def _caption(content: str) -> str:
+    """
+    Подготовка подписи к медиа для синтаксиса `![](url "title")`.
+    Title не может содержать кавычки и переносы строк — иначе разваливается
+    парс markdown и Telegram отвергает весь пост.
+    """
+    return content.replace("\n", " ").replace('"', "'").strip()
 
 
 def render_block(block: dict) -> str:
@@ -91,7 +102,9 @@ def render_block(block: dict) -> str:
         return "\n".join([head, sep] + ([body] if body else []))
 
     if t == "math":
-        return f"$$\n{content}\n$$"
+        # Блочная формула: ```math\n...\n``` (вариант из доков Rich Markdown).
+        # $$…$$ Telegram парсит как inline и иногда ломает мультистрочные формулы.
+        return f"```math\n{content}\n```"
 
     if t == "divider":
         return "---"
@@ -104,29 +117,30 @@ def render_block(block: dict) -> str:
         return f"<details>\n<summary>{title}</summary>\n\n{content}\n</details>"
 
     # ---- Медиа, встраиваемое по URL ----
-    if t == "photo":
+    # Telegram определяет тип медиа по MIME/расширению URL:
+    #   .jpg/.png → photo, .mp4 → video, .mp3/.ogg → audio, .gif → animation.
+    if t in ("photo", "video", "audio"):
         url = _url(block)
         if not url:
             return ""
-        return f'![]({url} "{content}")' if content else f"![]({url})"
-
-    if t == "video":
-        url = _url(block)
-        if not url:
-            return ""
-        return f'![]({url} "{content}")' if content else f"![]({url})"
+        cap = _caption(content)
+        return f'![]({url} "{cap}")' if cap else f"![]({url})"
 
     if t == "collage":
         urls = extra.get("urls", [])
         if not urls:
             return ""
+        # Внутри <tg-collage> элементы — каждый ![]() с новой строки.
+        # Окружающие пустые строки обязательны: иначе markdown слипнет
+        # с соседними блоками и tg-collage не распарсится.
         inner = "\n".join(f"![]({u})" for u in urls)
         return f"<tg-collage>\n\n{inner}\n\n</tg-collage>"
 
     if t == "map":
-        if "lat" not in extra:
+        if "lat" not in extra or "lon" not in extra:
             return ""
         zoom = extra.get("zoom", 14)
+        # Самозакрывающийся тег <tg-map .../> — атрибут долготы называется `long`.
         return f'<tg-map lat="{extra["lat"]}" long="{extra["lon"]}" zoom="{zoom}"/>'
 
     return content
