@@ -29,7 +29,12 @@ import panel
 from photo_search import search_photos
 from renderer import BLOCK_NAMES, render_post, render_preview
 from sender import send_rich
-from telegraph_upload import upload_audio, upload_photo, upload_video
+from telegraph_upload import (
+    close_session,
+    upload_audio,
+    upload_photo,
+    upload_video,
+)
 
 logging.basicConfig(level=logging.INFO)
 
@@ -42,6 +47,12 @@ dp = Dispatcher(storage=MemoryStorage())
 
 # Защита от двойного нажатия «Собрать пост».
 _exporting: set[int] = set()
+
+# Фоновые upload-таски коллажа: user_id -> list[Task[str|None]].
+# Каждое присланное фото сразу запускает upload, не блокируя обработку
+# следующего сообщения. На «Готово» делаем gather() — все аплоады
+# завершаются параллельно, а не один за другим.
+_collage_tasks: dict[int, list[asyncio.Task]] = {}
 
 
 class Flow(StatesGroup):
@@ -198,7 +209,8 @@ async def cb_new_block(call: CallbackQuery, state: FSMContext):
     if btype in MEDIA_PROMPT_STATE:
         st, prompt_text = MEDIA_PROMPT_STATE[btype]
         await state.set_state(st)
-        await state.update_data(collage=[])
+        # Сбрасываем накопленные параллельные таски прошлого коллажа.
+        _collage_tasks.pop(call.from_user.id, None)
         text, markup = _build_prompt_view(prompt_text)
         await panel.show(bot, call, text, markup)
         await call.answer()
@@ -298,33 +310,43 @@ async def on_audio(message: Message, state: FSMContext):
 
 @dp.message(Flow.waiting_collage, F.photo)
 async def on_collage_photo(message: Message, state: FSMContext):
-    data = await state.get_data()
-    urls = list(data.get("collage", []))
-    url = await upload_photo(bot, BOT_TOKEN, message.photo[-1].file_id)
+    user_id = message.from_user.id
+    file_id = message.photo[-1].file_id
+    # Стартуем upload фоном — не блокируем приём следующих фото.
+    # При media-group от Telegram сообщения приходят пачкой; так аплоады
+    # реально идут параллельно (5 фото за время одного).
+    task = asyncio.create_task(upload_photo(bot, BOT_TOKEN, file_id))
+    tasks = _collage_tasks.setdefault(user_id, [])
+    tasks.append(task)
     await panel.delete_user_message(message)
-    if not url:
-        # Просто игнорим конкретное фото, юзеру показываем счёт без апа.
-        text, markup = _build_collage_view(len(urls))
-        await panel.show(bot, message, text + emoji.html("\n\n⚠️ Последнее фото не залилось."), markup)
-        return
-    urls.append(url)
-    await state.update_data(collage=urls)
-    text, markup = _build_collage_view(len(urls))
+    text, markup = _build_collage_view(len(tasks))
     await panel.show(bot, message, text, markup)
 
 
 @dp.callback_query(F.data == "collage_done")
 async def cb_collage_done(call: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    photos = data.get("collage", [])
-    if not photos:
+    user_id = call.from_user.id
+    tasks = _collage_tasks.pop(user_id, [])
+    if not tasks:
         await call.answer("Нет фото", show_alert=True)
         return
-    post_id = await db.get_or_create_active_post(call.from_user.id)
+    # Дожидаемся ВСЕ параллельные аплоады разом.
+    await panel.show(bot, call, emoji.html("⏳ <b>Жду загрузку фото…</b>"), kb.back_menu())
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    photos = [r for r in results if isinstance(r, str) and r]
+    if not photos:
+        await call.answer("Ни одно фото не загрузилось", show_alert=True)
+        await _show_main(call)
+        return
+    post_id = await db.get_or_create_active_post(user_id)
     await db.add_block(post_id, "collage", extra={"urls": photos})
     await state.clear()
     await _show_main(call)
-    await call.answer(f"Альбом из {len(photos)} фото добавлен")
+    failed = len(results) - len(photos)
+    msg = f"Альбом из {len(photos)} фото добавлен"
+    if failed:
+        msg += f" (не загрузилось: {failed})"
+    await call.answer(msg)
 
 
 @dp.message(Flow.waiting_map)
@@ -517,7 +539,12 @@ async def main():
     await db.init_db()
     await emoji.load_packs(bot)
     logging.info("PostBuilder bot started")
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        # Аккуратно отпускаем ресурсы: keep-alive соединения и SQLite handle.
+        await close_session()
+        await db.close_db()
 
 
 if __name__ == "__main__":

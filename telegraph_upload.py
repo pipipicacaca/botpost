@@ -44,6 +44,35 @@ IMGBB_TTL_SEC = 600   # 10 минут
 LITTERBOX_TIME = "1h"  # минимально допустимое значение в API Litterbox
 
 
+# ── Один глобальный ClientSession на весь бот ─────────────────────────────
+# Каждый new ClientSession() = TLS handshake (~300–800мс). Переиспользуем
+# одну сессию с keep-alive: на 5 фото коллажа экономим 2–4 секунды.
+
+_session: aiohttp.ClientSession | None = None
+
+
+async def get_session() -> aiohttp.ClientSession:
+    global _session
+    if _session is None or _session.closed:
+        _session = aiohttp.ClientSession(
+            timeout=TIMEOUT,
+            headers={"User-Agent": UA},
+            connector=aiohttp.TCPConnector(
+                limit=20,         # макс параллельных запросов
+                ttl_dns_cache=300,
+                enable_cleanup_closed=True,
+            ),
+        )
+    return _session
+
+
+async def close_session() -> None:
+    global _session
+    if _session and not _session.closed:
+        await _session.close()
+        _session = None
+
+
 async def _download(bot, file_id: str) -> bytes | None:
     """Скачиваем файл из Telegram по file_id."""
     try:
@@ -59,84 +88,76 @@ async def _download(bot, file_id: str) -> bytes | None:
 
 
 async def _to_catbox(data: bytes, filename: str) -> str | None:
-    """Catbox.moe — постоянное хранение."""
     try:
+        s = await get_session()
         form = aiohttp.FormData()
         form.add_field("reqtype", "fileupload")
-        # БЕЗ явного content_type на файле — Catbox такие запросы режет.
         form.add_field("fileToUpload", data, filename=filename)
-        async with aiohttp.ClientSession(
-            timeout=TIMEOUT, headers={"User-Agent": UA}
-        ) as s:
-            async with s.post(CATBOX_API, data=form) as r:
-                text = (await r.text()).strip()
-                if text.startswith("http"):
-                    return text
-                log.warning("catbox bad response: %s", text[:200])
-                return None
+        async with s.post(CATBOX_API, data=form) as r:
+            text = (await r.text()).strip()
+            if text.startswith("http"):
+                return text
+            log.warning("catbox bad response: %s", text[:200])
+            return None
     except Exception as e:
         log.warning("catbox upload failed: %s", e)
         return None
 
 
 async def _to_litterbox(data: bytes, filename: str) -> str | None:
-    """Litterbox — временный (до 72ч) хост Catbox. Тот же API, другой эндпоинт."""
+    """Litterbox — временный (до 72ч) хост Catbox."""
     try:
+        s = await get_session()
         form = aiohttp.FormData()
         form.add_field("reqtype", "fileupload")
         form.add_field("time", LITTERBOX_TIME)
         form.add_field("fileToUpload", data, filename=filename)
-        async with aiohttp.ClientSession(
-            timeout=TIMEOUT, headers={"User-Agent": UA}
-        ) as s:
-            async with s.post(LITTERBOX_API, data=form) as r:
-                text = (await r.text()).strip()
-                if text.startswith("http"):
-                    return text
-                log.warning("litterbox bad response: %s", text[:200])
-                return None
+        async with s.post(LITTERBOX_API, data=form) as r:
+            text = (await r.text()).strip()
+            if text.startswith("http"):
+                return text
+            log.warning("litterbox bad response: %s", text[:200])
+            return None
     except Exception as e:
         log.warning("litterbox upload failed: %s", e)
         return None
 
 
 async def _to_uguu(data: bytes, filename: str) -> str | None:
-    """uguu.se — 3-дневное хранение. Возвращает JSON с files[0].url."""
+    """uguu.se — 3-дневное хранение."""
     try:
+        s = await get_session()
         form = aiohttp.FormData()
         form.add_field("files[]", data, filename=filename)
-        async with aiohttp.ClientSession(
-            timeout=TIMEOUT, headers={"User-Agent": UA, "Accept": "application/json"}
-        ) as s:
-            async with s.post(UGUU_API, data=form) as r:
-                try:
-                    j = await r.json(content_type=None)
-                except Exception:
-                    log.warning("uguu non-json (%s): %s", r.status, (await r.text())[:200])
-                    return None
-                if j.get("success") and j.get("files"):
-                    return j["files"][0].get("url")
-                log.warning("uguu bad response: %s", str(j)[:200])
+        async with s.post(UGUU_API, data=form, headers={"Accept": "application/json"}) as r:
+            try:
+                j = await r.json(content_type=None)
+            except Exception:
+                log.warning("uguu non-json (%s): %s", r.status, (await r.text())[:200])
                 return None
+            if j.get("success") and j.get("files"):
+                return j["files"][0].get("url")
+            log.warning("uguu bad response: %s", str(j)[:200])
+            return None
     except Exception as e:
         log.warning("uguu upload failed: %s", e)
         return None
 
 
 async def _to_imgbb(data: bytes) -> str | None:
-    """imgbb — только изображения. expiration=TTL → авто-удаление файла."""
+    """imgbb — только изображения. expiration → auto-delete."""
     try:
+        s = await get_session()
         b64 = base64.b64encode(data).decode()
         form = aiohttp.FormData()
         form.add_field("image", b64)
         url = f"{IMGBB_API}?key={IMGBB_KEY}&expiration={IMGBB_TTL_SEC}"
-        async with aiohttp.ClientSession(timeout=TIMEOUT) as s:
-            async with s.post(url, data=form) as r:
-                j = await r.json(content_type=None)
-                if j.get("success"):
-                    return j["data"]["url"]
-                log.warning("imgbb error: %s", j)
-                return None
+        async with s.post(url, data=form) as r:
+            j = await r.json(content_type=None)
+            if j.get("success"):
+                return j["data"]["url"]
+            log.warning("imgbb error: %s", j)
+            return None
     except Exception as e:
         log.warning("imgbb upload failed: %s", e)
         return None

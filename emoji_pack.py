@@ -39,16 +39,41 @@ async def load_packs(bot: Bot) -> None:
             n = 0
             for st in pack.stickers:
                 if st.emoji and st.custom_emoji_id:
-                    # Если эмодзи уже есть из другого пака — оставляем первый.
                     if _map.setdefault(st.emoji, st.custom_emoji_id) == st.custom_emoji_id:
                         n += 1
             log.info("loaded pack %s: %d emojis indexed (total: %d)",
                      name, n, len(_map))
         except Exception as e:
             log.warning("failed to load pack %s: %s", name, e)
-    # Greedy матчинг от длинных к коротким — для multi-codepoint эмодзи
-    # (флаги, ZWJ-последовательности и т.п.).
+    # Greedy матчинг от длинных к коротким — для multi-codepoint эмодзи.
     _keys_by_len[:] = sorted(_map.keys(), key=len, reverse=True)
+    # Логируем что у нас есть — поможет подкрутить маппинги под реальный пак.
+    if _map:
+        sample = " ".join(list(_map.keys())[:30])
+        log.info("emoji pack sample: %s …", sample)
+
+
+def icon_id(unicode_emoji: str) -> str | None:
+    """
+    custom_emoji_id для иконки на InlineKeyboardButton.icon_custom_emoji_id.
+
+    Пробуем несколько вариантов написания (с/без VS-16, разные ZWJ-формы),
+    т.к. пак может индексироваться чуть иначе.
+    """
+    if not unicode_emoji:
+        return None
+    # 1) прямой матч
+    if unicode_emoji in _map:
+        return _map[unicode_emoji]
+    # 2) без variation selector U+FE0F (часто отсутствует в одной из форм)
+    stripped = unicode_emoji.replace("️", "")
+    if stripped in _map:
+        return _map[stripped]
+    # 3) с добавленным VS-16
+    with_vs = unicode_emoji + "️" if "️" not in unicode_emoji else unicode_emoji
+    if with_vs in _map:
+        return _map[with_vs]
+    return None
 
 
 def _substitute(text: str, wrapper) -> str:

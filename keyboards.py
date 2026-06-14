@@ -1,69 +1,117 @@
-"""Инлайн-клавиатуры бота."""
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+"""
+Инлайн-клавиатуры с custom-emoji иконками (Bot API 10.x).
+
+Каждая кнопка строится через _btn(): задаём семантическую иконку как
+обычный unicode-эмодзи, билдер пытается достать соответствующий
+`custom_emoji_id` из загруженных паков (TgAndroidIcons / tgiosicons)
+и кладёт его в `icon_custom_emoji_id`. Если пак не загрузился — fallback
+на обычный эмодзи-префикс прямо в text.
+
+Цветные кнопки задаются через `style`:
+  • "success" — зелёная (главное действие — собрать пост)
+  • "danger"  — красная (удаление, очистка)
+  • "primary" — синяя (добавление)
+"""
 from aiogram.types import InlineKeyboardMarkup
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+import emoji_pack as emoji
+
+
+def _btn(builder: InlineKeyboardBuilder, label: str, icon: str,
+         callback_data: str, style: str | None = None) -> None:
+    """
+    Универсальная кнопка: пытаемся показать icon как custom_emoji_id;
+    если паки не загружены — печатаем icon в начале текста.
+    """
+    cid = emoji.icon_id(icon)
+    if cid:
+        builder.button(
+            text=label,
+            callback_data=callback_data,
+            icon_custom_emoji_id=cid,
+            style=style,
+        )
+    else:
+        builder.button(
+            text=f"{icon} {label}",
+            callback_data=callback_data,
+            style=style,
+        )
 
 
 def main_menu() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.button(text="➕ Добавить блок", callback_data="add")
-    kb.button(text="✏️ Редактировать", callback_data="edit_list")
-    kb.button(text="👁 Предпросмотр", callback_data="preview")
-    kb.button(text="📤 Собрать пост", callback_data="export")
-    kb.button(text="🗑 Очистить всё", callback_data="reset")
+    _btn(kb, "Добавить блок",  "➕", "add",       style="primary")
+    _btn(kb, "Редактировать",  "✏️", "edit_list")
+    _btn(kb, "Предпросмотр",   "👁",  "preview")
+    _btn(kb, "Собрать пост",   "📤", "export",    style="success")
+    _btn(kb, "Очистить всё",   "🗑", "reset",     style="danger")
     kb.adjust(1, 2, 2)
     return kb.as_markup()
 
 
 def block_types_menu() -> InlineKeyboardMarkup:
-    """Все типы блоков (на одной странице, сгруппированы)."""
+    """Все типы блоков на одном экране, сгруппированы adjust'ом."""
     kb = InlineKeyboardBuilder()
     # Текст и структура
-    kb.button(text="🔠 Заголовок", callback_data="new:heading")
-    kb.button(text="📝 Абзац", callback_data="new:text")
-    kb.button(text="• Список", callback_data="new:list")
-    kb.button(text="1. Нумер.", callback_data="new:numbered")
-    kb.button(text="☑️ Чеклист", callback_data="new:checklist")
-    kb.button(text="❝ Цитата", callback_data="new:quote")
+    _btn(kb, "Заголовок",   "🔠", "new:heading")
+    _btn(kb, "Абзац",       "📝", "new:text")
+    _btn(kb, "Список",      "•",  "new:list")
+    _btn(kb, "Нумер.",      "🔢", "new:numbered")
+    _btn(kb, "Чеклист",     "☑️", "new:checklist")
+    _btn(kb, "Цитата",      "❝",  "new:quote")
     # Продвинутое
-    kb.button(text="▦ Таблица", callback_data="new:table")
-    kb.button(text="∑ Формула", callback_data="new:math")
-    kb.button(text="💻 Код", callback_data="new:code")
-    kb.button(text="❞ Pull-quote", callback_data="new:pullquote")
-    kb.button(text="▸ Спойлер", callback_data="new:collapsible")
-    kb.button(text="➖ Разделитель", callback_data="new:divider")
+    _btn(kb, "Таблица",     "▦",  "new:table")
+    _btn(kb, "Формула",     "∑",  "new:math")
+    _btn(kb, "Код",         "💻", "new:code")
+    _btn(kb, "Pull-quote",  "❞",  "new:pullquote")
+    _btn(kb, "Спойлер",     "🙈", "new:collapsible")
+    _btn(kb, "Разделитель", "➖", "new:divider")
     # Медиа
-    kb.button(text="🖼 Фото", callback_data="new:photo")
-    kb.button(text="🔍 Фото-поиск", callback_data="new:photosearch")
-    kb.button(text="🎬 Видео", callback_data="new:video")
-    kb.button(text="🎵 Аудио", callback_data="new:audio")
-    kb.button(text="🖼 Альбом (свайп)", callback_data="new:collage")
-    kb.button(text="📍 Карта", callback_data="new:map")
-    kb.button(text="⬅️ Назад", callback_data="back")
+    _btn(kb, "Фото",            "🖼", "new:photo")
+    _btn(kb, "Фото-поиск",      "🔍", "new:photosearch")
+    _btn(kb, "Видео",           "🎬", "new:video")
+    _btn(kb, "Аудио",           "🎵", "new:audio")
+    _btn(kb, "Альбом (свайп)",  "🖼", "new:collage")
+    _btn(kb, "Карта",           "📍", "new:map")
+    _btn(kb, "Назад",           "⬅️", "back")
     kb.adjust(2, 2, 2, 2, 2, 2, 2, 2, 2, 1)
     return kb.as_markup()
 
 
 def edit_list_menu(blocks: list[dict]) -> InlineKeyboardMarkup:
+    """Список блоков для выбора + кнопка назад."""
+    # Иконки по типу блока — те же, что в block_types_menu.
+    icon_for_type = {
+        "heading": "🔠", "text": "📝", "list": "•", "numbered": "🔢",
+        "checklist": "☑️", "quote": "❝", "code": "💻", "table": "▦",
+        "math": "∑", "divider": "➖", "pullquote": "❞", "collapsible": "🙈",
+        "photo": "🖼", "video": "🎬", "audio": "🎵", "collage": "🖼", "map": "📍",
+    }
     kb = InlineKeyboardBuilder()
     for i, b in enumerate(blocks, 1):
-        kb.button(text=f"{i}. {b['type']}", callback_data=f"sel:{b['id']}")
-    kb.button(text="⬅️ Назад", callback_data="back")
+        icon = icon_for_type.get(b["type"], "▫️")
+        prev = (b.get("content") or "").replace("\n", " ")[:24]
+        label = f"{i}. {prev}" if prev else f"{i}."
+        _btn(kb, label, icon, f"sel:{b['id']}")
+    _btn(kb, "Назад", "⬅️", "back")
     kb.adjust(1)
     return kb.as_markup()
 
 
 def block_actions_menu(block_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.button(text="✏️ Изменить", callback_data=f"editblock:{block_id}")
-    kb.button(text="🔼 Вверх", callback_data=f"up:{block_id}")
-    kb.button(text="🔽 Вниз", callback_data=f"down:{block_id}")
-    kb.button(text="🗑 Удалить", callback_data=f"del:{block_id}")
-    kb.button(text="⬅️ К списку", callback_data="edit_list")
+    _btn(kb, "Изменить",  "✏️", f"editblock:{block_id}")
+    _btn(kb, "Вверх",     "🔼", f"up:{block_id}")
+    _btn(kb, "Вниз",      "🔽", f"down:{block_id}")
+    _btn(kb, "Удалить",   "🗑", f"del:{block_id}", style="danger")
+    _btn(kb, "К списку",  "⬅️", "edit_list")
     kb.adjust(1, 2, 1, 1)
     return kb.as_markup()
 
 
 def back_menu() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.button(text="⬅️ В меню", callback_data="back")
+    _btn(kb, "Отмена", "⬅️", "back")
     return kb.as_markup()
