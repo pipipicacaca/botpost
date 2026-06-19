@@ -12,6 +12,8 @@
   • "danger"  — красная (удаление, очистка)
   • "primary" — синяя (добавление)
 """
+from functools import lru_cache
+
 from aiogram.types import InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -45,6 +47,7 @@ def _btn(builder: InlineKeyboardBuilder, label: str, icons,
     )
 
 
+@lru_cache(maxsize=1)
 def main_menu() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     _btn(kb, "Добавить блок",  ["➕", "✚", "🆕"],       "add",       style="primary")
@@ -56,6 +59,7 @@ def main_menu() -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
+@lru_cache(maxsize=1)
 def block_types_menu() -> InlineKeyboardMarkup:
     """Все типы блоков на одном экране, сгруппированы adjust'ом."""
     kb = InlineKeyboardBuilder()
@@ -71,13 +75,13 @@ def block_types_menu() -> InlineKeyboardMarkup:
     # Продвинутое
     _btn(kb, "Таблица",     ["▦", "📊", "📈", "🔲"], "new:table")
     _btn(kb, "Формула",     ["∑", "🧮", "📐", "📏"], "new:math")
+    _btn(kb, "Задача",      ["🧩", "📚", "✏️", "📝"], "new:task")
     _btn(kb, "Код",         ["💻", "⌨️", "🖥", "📟"], "new:code")
     _btn(kb, "Pull-quote",  ["❞", "💬", "🗨️", "📜"], "new:pullquote")
     _btn(kb, "Спойлер",     ["🙈", "👁‍🗨", "🔽", "▶️", "📂", "📁"], "new:collapsible")
     _btn(kb, "Разделитель", ["➖", "—", "━", "─", "〰️", "▬"], "new:divider")
     # Медиа
     _btn(kb, "Фото",            ["🖼", "📷", "📸", "🌄"], "new:photo")
-    _btn(kb, "Фото-поиск",      ["🔍", "🔎", "🔭", "🖼", "📸"], "new:photosearch")
     _btn(kb, "Видео",           ["🎬", "🎥", "📹", "📽", "▶️"], "new:video")
     _btn(kb, "Аудио",           ["🎵", "🎶", "🎧", "🔊", "🎤"], "new:audio")
     _btn(kb, "Альбом (свайп)",  ["🖼", "📷", "📸", "🌅"], "new:collage")
@@ -100,6 +104,7 @@ def edit_list_menu(blocks: list[dict]) -> InlineKeyboardMarkup:
         "code":        ["💻", "⌨️", "🖥", "📟"],
         "table":       ["▦", "📊", "📈", "🔲"],
         "math":        ["∑", "🧮", "📐", "📏"],
+        "task":        ["🧩", "📚", "✏️", "📝"],
         "divider":     ["➖", "—", "━", "─", "〰️", "▬"],
         "pullquote":   ["❞", "💬", "🗨️", "📜"],
         "collapsible": ["🙈", "👁‍🗨", "🔽", "▶️", "📂", "📁"],
@@ -131,7 +136,22 @@ def block_actions_menu(block_id: int) -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
+@lru_cache(maxsize=1)
 def back_menu() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     _btn(kb, "Отмена", ["⬅️", "◀️", "↩️", "❌"], "back")
+    return kb.as_markup()
+
+
+@lru_cache(maxsize=1)
+def formula_templates_menu() -> InlineKeyboardMarkup:
+    """Меню шаблонов конструктора формул. Импорт внутри — избегаем
+    циклической зависимости keyboards ↔ formula_templates на старте."""
+    from formula_templates import TEMPLATES
+    kb = InlineKeyboardBuilder()
+    for tid, tpl in TEMPLATES.items():
+        kb.button(text=tpl.name, callback_data=f"formula:{tid}")
+    _btn(kb, "Ручной LaTeX", ["✏️", "📝"], "formula:raw")
+    _btn(kb, "Назад",       ["⬅️", "◀️", "↩️"], "back")
+    kb.adjust(2, 2, 2, 2, 2, 2, 1, 1)
     return kb.as_markup()

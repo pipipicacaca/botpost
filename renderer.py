@@ -21,6 +21,7 @@ BLOCK_NAMES = {
     "code":        "💻 Код",
     "table":       "▦ Таблица",
     "math":        "∑ Формула",
+    "task":        "🧩 Задача",
     "divider":     "➖ Разделитель",
     "pullquote":   "❞ Pull-quote",
     "collapsible": "▸ Спойлер-секция",
@@ -105,6 +106,19 @@ def render_block(block: dict) -> str:
         # Блочная формула: ```math\n...\n``` (вариант из доков Rich Markdown).
         # $$…$$ Telegram парсит как inline и иногда ломает мультистрочные формулы.
         return f"```math\n{content}\n```"
+
+    if t == "task":
+        # Структурированная задача: Дано / Найти / Решение / Ответ.
+        # Поля могут содержать LaTeX в `$…$` — Telegram парсит inline math.
+        title = (extra.get("title") or "").strip()
+        head = f"### 🧩 {title}" if title else "### 🧩 Задача"
+        parts = [head]
+        for label, key in (("Дано", "given"), ("Найти", "find"),
+                           ("Решение", "solution"), ("Ответ", "answer")):
+            val = (extra.get(key) or "").strip()
+            if val:
+                parts.append(f"**{label}:** {val}")
+        return "\n\n".join(parts)
 
     if t == "divider":
         return "---"

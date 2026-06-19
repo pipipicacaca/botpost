@@ -26,7 +26,7 @@ import database as db
 import emoji_pack as emoji
 import keyboards as kb
 import panel
-from photo_search import search_photos
+from formula_templates import TEMPLATES as FORMULA_TEMPLATES
 from renderer import BLOCK_NAMES, render_post, render_preview
 from sender import send_rich
 from telegraph_upload import (
@@ -54,16 +54,51 @@ _exporting: set[int] = set()
 # завершаются параллельно, а не один за другим.
 _collage_tasks: dict[int, list[asyncio.Task]] = {}
 
+# Фоновые upload-таски одиночных медиа (фото/видео/аудио): user_id -> list[Task].
+# Пользователь получает мгновенный отклик — блок появляется в панели сразу,
+# а Telegraph upload едет в фоне. На «Собрать пост» дожидаемся всех тасков.
+_media_tasks: dict[int, list[asyncio.Task]] = {}
+
+
+async def _upload_and_update(block_id: int, post_id: int, kind: str,
+                             file_id: str, ext: str = "") -> None:
+    """Фоновый upload медиа → запись URL в extra блока + invalidate кэш."""
+    try:
+        if kind == "photo":
+            url = await upload_photo(bot, BOT_TOKEN, file_id)
+        elif kind == "video":
+            url = await upload_video(bot, BOT_TOKEN, file_id)
+        elif kind == "audio":
+            url = await upload_audio(bot, file_id, ext)
+        else:
+            return
+        if url:
+            await db.update_block(block_id, extra={"url": url})
+    except Exception as e:
+        logging.warning("background upload failed (%s, block %s): %s", kind, block_id, e)
+
 
 class Flow(StatesGroup):
     waiting_content = State()
     waiting_photo = State()
-    waiting_photo_query = State()
     waiting_video = State()
     waiting_audio = State()
     waiting_collage = State()
     waiting_map = State()
     waiting_edit = State()
+    waiting_formula_field = State()
+    waiting_task_field = State()
+
+
+# Поля «Задачи» — собираются последовательно через FSM. Пустой ввод
+# (или «-») пропускает поле, чтобы можно было оформить условие без решения.
+TASK_FIELDS: list[tuple[str, str]] = [
+    ("title",    "Название задачи (или «-», чтобы пропустить)"),
+    ("given",    "Дано (что известно)"),
+    ("find",     "Найти (что нужно вычислить)"),
+    ("solution", "Решение (можно несколько строк; «-» — пропустить)"),
+    ("answer",   "Ответ (или «-», чтобы пропустить)"),
+]
 
 
 PROMPTS = {
@@ -192,7 +227,6 @@ async def cmd_emojis(message: Message):
         "Чеклист":     ["☑️", "✅", "✔️", "📋", "📝"],
         "Спойлер":     ["🙈", "👁‍🗨", "🔽", "▶️", "📂", "📁"],
         "Разделитель": ["➖", "—", "━", "─", "〰️", "▬"],
-        "Фото-поиск":  ["🔍", "🔎", "🔭", "🖼", "📸"],
         "Видео":       ["🎬", "🎥", "📹", "📽", "▶️"],
     }
     lines = [f"📦 <b>Загружено эмодзи:</b> {len(keys)}\n"]
@@ -241,10 +275,21 @@ async def cb_new_block(call: CallbackQuery, state: FSMContext):
         await call.answer("Разделитель добавлен")
         return
 
-    if btype == "photosearch":
-        await state.set_state(Flow.waiting_photo_query)
-        text, markup = _build_prompt_view("🔍 <b>Поиск фото</b>\n\nЧто искать? Напиши запрос:")
-        await panel.show(bot, call, text, markup)
+    if btype == "math":
+        # Формула — через конструктор шаблонов, а не сразу LaTeX-поле.
+        text = emoji.html(
+            "∑ <b>Формула — выбери шаблон</b>\n\n"
+            "Бот соберёт LaTeX сам по полям."
+        )
+        await panel.show(bot, call, text, kb.formula_templates_menu())
+        await call.answer()
+        return
+
+    if btype == "task":
+        # Конструктор задачи — последовательный сбор полей.
+        await state.set_state(Flow.waiting_task_field)
+        await state.update_data(post_id=post_id, field_idx=0, values={})
+        await _ask_task_field(call, state)
         await call.answer()
         return
 
@@ -264,6 +309,107 @@ async def cb_new_block(call: CallbackQuery, state: FSMContext):
     text, markup = _build_prompt_view(PROMPTS.get(btype, "Текст:"))
     await panel.show(bot, call, text, markup)
     await call.answer()
+
+
+async def _ask_task_field(target, state: FSMContext) -> None:
+    data = await state.get_data()
+    idx = data["field_idx"]
+    key, prompt = TASK_FIELDS[idx]
+    step = f"Шаг {idx + 1}/{len(TASK_FIELDS)}"
+    text = emoji.html(f"🧩 <b>Задача</b> — {step}\n\n{prompt}:")
+    await panel.show(bot, target, text, kb.back_menu())
+
+
+@dp.message(Flow.waiting_task_field)
+async def on_task_field(message: Message, state: FSMContext):
+    data = await state.get_data()
+    idx = data["field_idx"]
+    key, _ = TASK_FIELDS[idx]
+    raw = (message.text or "").strip()
+    # «-» — явный пропуск поля. Полезно для задач без решения/ответа.
+    values = dict(data["values"])
+    values[key] = "" if raw == "-" else raw
+    await panel.delete_user_message(message)
+
+    if idx + 1 < len(TASK_FIELDS):
+        await state.update_data(values=values, field_idx=idx + 1)
+        await _ask_task_field(message, state)
+        return
+
+    title = values.get("title") or "Задача"
+    await db.add_block(data["post_id"], "task", content=title, extra=values)
+    await state.clear()
+    await _show_main(message)
+
+
+async def _ask_formula_field(target, state: FSMContext) -> None:
+    """Показать prompt для текущего поля шаблона формулы."""
+    data = await state.get_data()
+    tpl = FORMULA_TEMPLATES[data["tpl_id"]]
+    idx = data["field_idx"]
+    key, prompt = tpl.fields[idx]
+    step = f"Шаг {idx + 1}/{len(tpl.fields)}"
+    text = emoji.html(f"∑ <b>{tpl.name}</b> — {step}\n\n{prompt}:")
+    await panel.show(bot, target, text, kb.back_menu())
+
+
+@dp.callback_query(F.data.startswith("formula:"))
+async def cb_formula_template(call: CallbackQuery, state: FSMContext):
+    tpl_id = call.data.split(":", 1)[1]
+    post_id = await db.get_or_create_active_post(call.from_user.id)
+
+    if tpl_id == "raw":
+        # Старое поведение — ручной LaTeX.
+        await state.update_data(btype="math", post_id=post_id)
+        await state.set_state(Flow.waiting_content)
+        text, markup = _build_prompt_view(PROMPTS["math"])
+        await panel.show(bot, call, text, markup)
+        await call.answer()
+        return
+
+    tpl = FORMULA_TEMPLATES.get(tpl_id)
+    if not tpl:
+        await call.answer("Неизвестный шаблон", show_alert=True)
+        return
+
+    await state.set_state(Flow.waiting_formula_field)
+    await state.update_data(
+        post_id=post_id, tpl_id=tpl_id, field_idx=0, values={}
+    )
+    await _ask_formula_field(call, state)
+    await call.answer()
+
+
+@dp.message(Flow.waiting_formula_field)
+async def on_formula_field(message: Message, state: FSMContext):
+    data = await state.get_data()
+    tpl = FORMULA_TEMPLATES[data["tpl_id"]]
+    idx = data["field_idx"]
+    key, _ = tpl.fields[idx]
+    values = dict(data["values"])
+    values[key] = message.text or ""
+    await panel.delete_user_message(message)
+
+    if idx + 1 < len(tpl.fields):
+        await state.update_data(values=values, field_idx=idx + 1)
+        await _ask_formula_field(message, state)
+        return
+
+    # Все поля собраны — рендерим LaTeX и сохраняем как math-блок.
+    try:
+        latex = tpl.render(values)
+    except Exception as e:
+        logging.warning("formula render failed (%s): %s", data["tpl_id"], e)
+        await state.clear()
+        await panel.show(
+            bot, message,
+            emoji.html(f"⚠️ <b>Ошибка сборки формулы:</b> {e}"),
+            kb.back_menu(),
+        )
+        return
+    await db.add_block(data["post_id"], "math", content=latex)
+    await state.clear()
+    await _show_main(message)
 
 
 @dp.message(Flow.waiting_content)
@@ -298,17 +444,15 @@ async def on_content(message: Message, state: FSMContext):
 
 @dp.message(Flow.waiting_photo, F.photo)
 async def on_photo(message: Message, state: FSMContext):
-    post_id = await db.get_or_create_active_post(message.from_user.id)
+    user_id = message.from_user.id
+    post_id = await db.get_or_create_active_post(user_id)
     file_id = message.photo[-1].file_id
-    # Подсказываем «грузим» прямо в панели.
-    await panel.show(bot, message, emoji.html("⏳ <b>Загружаю фото…</b>"), kb.back_menu())
-    url = await upload_photo(bot, BOT_TOKEN, file_id)
-    if url:
-        await db.add_block(post_id, "photo", content=message.caption or "",
-                           media_id=file_id, extra={"url": url})
-    else:
-        await db.add_block(post_id, "photo", content=message.caption or "",
-                           media_id=file_id)
+    # Сначала создаём блок без URL — пользователь видит результат мгновенно.
+    block_id = await db.add_block(post_id, "photo",
+                                  content=message.caption or "", media_id=file_id)
+    # Upload летит в фон. На «Собрать пост» дождёмся.
+    task = asyncio.create_task(_upload_and_update(block_id, post_id, "photo", file_id))
+    _media_tasks.setdefault(user_id, []).append(task)
     await state.clear()
     await panel.delete_user_message(message)
     await _show_main(message)
@@ -316,16 +460,13 @@ async def on_photo(message: Message, state: FSMContext):
 
 @dp.message(Flow.waiting_video, F.video)
 async def on_video(message: Message, state: FSMContext):
-    post_id = await db.get_or_create_active_post(message.from_user.id)
+    user_id = message.from_user.id
+    post_id = await db.get_or_create_active_post(user_id)
     file_id = message.video.file_id
-    await panel.show(bot, message, emoji.html("⏳ <b>Загружаю видео…</b>"), kb.back_menu())
-    url = await upload_video(bot, BOT_TOKEN, file_id)
-    if url:
-        await db.add_block(post_id, "video", content=message.caption or "",
-                           media_id=file_id, extra={"url": url})
-    else:
-        await db.add_block(post_id, "video", content=message.caption or "",
-                           media_id=file_id)
+    block_id = await db.add_block(post_id, "video",
+                                  content=message.caption or "", media_id=file_id)
+    task = asyncio.create_task(_upload_and_update(block_id, post_id, "video", file_id))
+    _media_tasks.setdefault(user_id, []).append(task)
     await state.clear()
     await panel.delete_user_message(message)
     await _show_main(message)
@@ -333,18 +474,15 @@ async def on_video(message: Message, state: FSMContext):
 
 @dp.message(Flow.waiting_audio, F.audio)
 async def on_audio(message: Message, state: FSMContext):
-    post_id = await db.get_or_create_active_post(message.from_user.id)
+    user_id = message.from_user.id
+    post_id = await db.get_or_create_active_post(user_id)
     file_id = message.audio.file_id
-    await panel.show(bot, message, emoji.html("⏳ <b>Загружаю аудио…</b>"), kb.back_menu())
     mime = (message.audio.mime_type or "").lower()
     ext = "ogg" if "ogg" in mime else "mp3"
-    url = await upload_audio(bot, file_id, ext)
-    if url:
-        await db.add_block(post_id, "audio", content=message.caption or "",
-                           media_id=file_id, extra={"url": url})
-    else:
-        await db.add_block(post_id, "audio", content=message.caption or "",
-                           media_id=file_id)
+    block_id = await db.add_block(post_id, "audio",
+                                  content=message.caption or "", media_id=file_id)
+    task = asyncio.create_task(_upload_and_update(block_id, post_id, "audio", file_id, ext))
+    _media_tasks.setdefault(user_id, []).append(task)
     await state.clear()
     await panel.delete_user_message(message)
     await _show_main(message)
@@ -415,24 +553,6 @@ async def on_map(message: Message, state: FSMContext):
     await db.add_block(post_id, "map", extra={"lat": lat, "lon": lon})
     await state.clear()
     await panel.delete_user_message(message)
-    await _show_main(message)
-
-
-@dp.message(Flow.waiting_photo_query)
-async def on_photo_query(message: Message, state: FSMContext):
-    query = message.text or ""
-    await panel.delete_user_message(message)
-    await panel.show(bot, message, emoji.html("⏳ <b>Ищу фото…</b>"), kb.back_menu())
-    results = await search_photos(query)
-    await state.clear()
-    if not results:
-        text, markup = _build_prompt_view(
-            "🔍 <b>Поиск фото</b>\n\n😕 Ничего не нашёл. Попробуй другой запрос."
-        )
-        await panel.show(bot, message, text, markup)
-        return
-    post_id = await db.get_or_create_active_post(message.from_user.id)
-    await db.add_block(post_id, "photo", extra={"url": results[0]})
     await _show_main(message)
 
 
@@ -540,14 +660,22 @@ async def cb_export(call: CallbackQuery):
 
 
 async def _do_export(call: CallbackQuery):
-    post_id = await db.get_or_create_active_post(call.from_user.id)
+    uid = call.from_user.id
+    post_id = await db.get_or_create_active_post(uid)
+
+    # Панель → «собираю», конечный пост уйдёт отдельным сообщением.
+    await panel.show(bot, call, emoji.html("📤 <b>Собираю пост…</b>"), kb.back_menu())
+
+    # Дожидаемся ещё не завершённые фоновые upload медиа — иначе блоки будут
+    # без URL и render_block выкинет их из поста.
+    pending = _media_tasks.pop(uid, [])
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
     blocks = await db.get_blocks(post_id)
     if not blocks:
         await call.message.answer("Пост пуст — нечего собирать.")
         return
-
-    # Панель → «собираю», конечный пост уйдёт отдельным сообщением.
-    await panel.show(bot, call, emoji.html("📤 <b>Собираю пост…</b>"), kb.back_menu())
 
     # Кастомные эмодзи в финальном посте — превращаем unicode → tg-emoji
     # внутри markdown (![](tg://emoji?id=...)).
@@ -572,6 +700,9 @@ async def _do_export(call: CallbackQuery):
 @dp.callback_query(F.data == "reset")
 async def cb_reset(call: CallbackQuery, state: FSMContext):
     await state.clear()
+    # Отменяем висящие upload — пользователю они больше не нужны.
+    for t in _media_tasks.pop(call.from_user.id, []):
+        t.cancel()
     await db.reset_post(call.from_user.id)
     await _show_main(call)
     await call.answer("Пост очищен")

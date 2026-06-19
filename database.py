@@ -20,6 +20,23 @@ DB_PATH = Path(__file__).parent / "postbot.db"
 # внутри своего worker-thread'а, так что конкурентные await'ы безопасны.
 _db: aiosqlite.Connection | None = None
 
+# In-memory кэш горячих чтений. Цель — снять SQLite-запросы с каждого
+# нажатия кнопки в панели. Кэш read-through: при write инвалидируется.
+#   _active_post: user_id -> post_id активного поста
+#   _blocks:      post_id -> список блоков (как возвращает get_blocks)
+_active_post: dict[int, int] = {}
+_blocks: dict[int, list[dict]] = {}
+
+
+def _invalidate_post(post_id: int) -> None:
+    _blocks.pop(post_id, None)
+
+
+def _invalidate_user(user_id: int) -> None:
+    pid = _active_post.pop(user_id, None)
+    if pid is not None:
+        _blocks.pop(pid, None)
+
 
 async def init_db() -> None:
     """Открыть коннекцию и создать таблицы."""
@@ -71,6 +88,9 @@ def _conn() -> aiosqlite.Connection:
 # ---------- ПОСТЫ ----------
 
 async def get_or_create_active_post(user_id: int) -> int:
+    cached = _active_post.get(user_id)
+    if cached is not None:
+        return cached
     db = _conn()
     cur = await db.execute(
         "SELECT id FROM posts WHERE user_id=? AND is_active=1 ORDER BY id DESC LIMIT 1;",
@@ -78,9 +98,11 @@ async def get_or_create_active_post(user_id: int) -> int:
     )
     row = await cur.fetchone()
     if row:
+        _active_post[user_id] = row[0]
         return row[0]
     cur = await db.execute("INSERT INTO posts (user_id) VALUES (?);", (user_id,))
     await db.commit()
+    _active_post[user_id] = cur.lastrowid
     return cur.lastrowid
 
 
@@ -91,6 +113,8 @@ async def reset_post(user_id: int) -> int:
     )
     cur = await db.execute("INSERT INTO posts (user_id) VALUES (?);", (user_id,))
     await db.commit()
+    _invalidate_user(user_id)
+    _active_post[user_id] = cur.lastrowid
     return cur.lastrowid
 
 
@@ -110,6 +134,7 @@ async def add_block(post_id: int, btype: str, content: str = "",
         (post_id, max_pos + 1, btype, content, media_id, extra_json),
     )
     await db.commit()
+    _invalidate_post(post_id)
     return cur.lastrowid
 
 
@@ -124,11 +149,16 @@ def _row_to_block(row) -> dict:
 
 
 async def get_blocks(post_id: int) -> list[dict]:
+    cached = _blocks.get(post_id)
+    if cached is not None:
+        return cached
     db = _conn()
     cur = await db.execute(
         "SELECT * FROM blocks WHERE post_id=? ORDER BY position;", (post_id,)
     )
-    return [_row_to_block(r) for r in await cur.fetchall()]
+    result = [_row_to_block(r) for r in await cur.fetchall()]
+    _blocks[post_id] = result
+    return result
 
 
 async def get_block(block_id: int) -> dict | None:
@@ -151,12 +181,21 @@ async def update_block(block_id: int, content: str = None,
             (json.dumps(extra, ensure_ascii=False), block_id),
         )
     await db.commit()
+    cur = await db.execute("SELECT post_id FROM blocks WHERE id=?;", (block_id,))
+    row = await cur.fetchone()
+    if row:
+        _invalidate_post(row["post_id"])
 
 
 async def delete_block(block_id: int) -> None:
     db = _conn()
+    cur = await db.execute("SELECT post_id FROM blocks WHERE id=?;", (block_id,))
+    row = await cur.fetchone()
+    post_id = row["post_id"] if row else None
     await db.execute("DELETE FROM blocks WHERE id=?;", (block_id,))
     await db.commit()
+    if post_id is not None:
+        _invalidate_post(post_id)
 
 
 async def move_block(block_id: int, direction: int) -> None:
@@ -176,3 +215,4 @@ async def move_block(block_id: int, direction: int) -> None:
     await db.execute("UPDATE blocks SET position=? WHERE id=?;", (new_pos, block_id))
     await db.execute("UPDATE blocks SET position=? WHERE id=?;", (pos, neighbor["id"]))
     await db.commit()
+    _invalidate_post(post_id)
